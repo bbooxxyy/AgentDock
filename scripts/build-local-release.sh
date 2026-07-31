@@ -50,6 +50,41 @@ ARTIFACT_PATH="$ARTIFACT_DIR/$(basename "$DMG_PATH")"
 CHECKSUM_PATH="$ARTIFACT_PATH.sha256"
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
+  node - <<'NODE'
+const fs = require("fs");
+const required = [
+  "AGENTDOCK_OTLP_ENDPOINT",
+  "AGENTDOCK_OTLP_TOKEN",
+  "AGENTDOCK_OTLP_SERVICE_NAME",
+];
+const local = {};
+if (fs.existsSync(".env")) {
+  for (const rawLine of fs.readFileSync(".env", "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) continue;
+    const key = line.slice(0, separator).trim();
+    let value = line.slice(separator + 1).trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1).trim();
+    }
+    if (value) local[key] = value;
+  }
+}
+const missing = required.filter(
+  (name) => !(process.env[name]?.trim() || local[name]?.trim()),
+);
+if (missing.length) {
+  console.error("Missing packaged OTLP configuration: " + missing.join(", "));
+  process.exit(1);
+}
+console.log("Packaged OTLP configuration verified.");
+NODE
   printf 'Building AgentDock %s for Intel and Apple silicon Macs...\n' "$VERSION"
   rustup target add aarch64-apple-darwin x86_64-apple-darwin
   npm run build -- --target universal-apple-darwin

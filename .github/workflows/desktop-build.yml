@@ -13,6 +13,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.platform }}
+    environment: APPLE_CERTIFICATE
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -55,6 +56,28 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Verify packaged OTLP configuration
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          AGENTDOCK_OTLP_ENDPOINT: ${{ vars.AGENTDOCK_OTLP_ENDPOINT }}
+          AGENTDOCK_OTLP_TOKEN: ${{ secrets.AGENTDOCK_OTLP_TOKEN }}
+          AGENTDOCK_OTLP_SERVICE_NAME: ${{ vars.AGENTDOCK_OTLP_SERVICE_NAME }}
+        run: |
+          node - <<'NODE'
+          const required = [
+            "AGENTDOCK_OTLP_ENDPOINT",
+            "AGENTDOCK_OTLP_TOKEN",
+            "AGENTDOCK_OTLP_SERVICE_NAME",
+          ];
+          const missing = required.filter((name) => !process.env[name]?.trim());
+          if (missing.length) {
+            console.error(`Missing packaged OTLP configuration: ${missing.join(", ")}`);
+            process.exit(1);
+          }
+          console.log("Packaged OTLP configuration verified.");
+          NODE
 
       - name: Import macOS signing certificate
         if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
