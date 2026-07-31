@@ -14,6 +14,7 @@
     "build": "tauri build",
     "dev:ui": "vite --host 127.0.0.1 --port 1420",
     "build:ui": "vite build",
+    "test:frontend": "node --test tests/*.test.js",
     "preview": "vite preview --host 127.0.0.1 --port 1420",
     "release:local": "./scripts/build-local-release.sh",
     "release:macmini": "./scripts/release-macmini.sh",
