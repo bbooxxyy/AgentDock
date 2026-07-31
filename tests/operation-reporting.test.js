@@ -19,6 +19,7 @@ test("top bar reports all execution logs without the local-service badge", () =>
 test("source footer provides manual app update checks and keeps hourly checks", () => {
   assert.match(html, /id="current-version-label">当前版本<\/span><strong id="version-label">--<\/strong>/);
   assert.match(html, /state\.status\?\.appVersion \|\| state\.appUpdate\?\.currentVersion/);
+  assert.match(html, /currentVersion \? `v\$\{currentVersion\}` : "--"/);
   assert.match(html, /id="app-update-button" data-action="check-app-update"/);
   assert.match(html, /checkForAppUpdate\(\{ force: true, announce: true \}\)/);
   assert.match(html, /APP_UPDATE_CHECK_INTERVAL_MS = 60 \* 60 \* 1000/);

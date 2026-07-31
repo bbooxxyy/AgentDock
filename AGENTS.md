@@ -1,6 +1,7 @@
 # Repository Instructions
 
 - Do not commit, tag, or push to GitHub unless the user explicitly requests it.
+- Every repository modification must increment the application patch version before verification and deployment. Keep the version synchronized in `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and `src-tauri/Cargo.lock`.
 - After modifying the repository, run the relevant checks and deploy the verified build with `npm run release:macmini`.
 - Every Mac mini release must also create a locally installable universal macOS DMG in `release-artifacts/` and verify that it contains the Intel `x86_64` architecture.
 - The default deployment target is `duagent@192.168.14.2:/Applications/AgentDock.app`.

@@ -142,7 +142,7 @@ body { background: var(--canvas); }
 .source-empty { display: grid; min-height: 180px; place-items: center; align-content: center; padding: 18px; color: var(--ink-faint); text-align: center; font-size: 10px; line-height: 1.55; }
 .source-empty svg { width: 20px; height: 20px; margin-bottom: 8px; }
 .source-footer { display: grid; min-width: 0; align-content: center; gap: 6px; border-top: 1px solid var(--line); padding: 8px 13px; }
-.source-version-row { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; color: var(--ink-soft); font-size: 9px; }
+.source-version-row { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 4px; color: var(--ink-soft); font-size: 9px; }
 .source-version-row strong { overflow: hidden; color: var(--ink); font: 650 10px/1.2 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .source-update-button { display: inline-flex; width: 100%; min-width: 0; min-height: 36px; align-items: center; justify-content: center; gap: 6px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink); padding: 0 8px; font-size: 10px; font-weight: 680; }
 .source-update-button:hover { border-color: #9eaaa4; background: var(--surface-raised); }

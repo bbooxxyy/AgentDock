@@ -2104,7 +2104,8 @@
     function renderAppUpdate() {
       const button = document.getElementById("app-update-button");
       document.getElementById("current-version-label").textContent = tr("appUpdate.currentVersion", "当前版本");
-      document.getElementById("version-label").textContent = state.status?.appVersion || state.appUpdate?.currentVersion || "--";
+      const currentVersion = String(state.status?.appVersion || state.appUpdate?.currentVersion || "").replace(/^v/i, "");
+      document.getElementById("version-label").textContent = currentVersion ? `v${currentVersion}` : "--";
       const version = state.appUpdate?.latestVersion || "";
       const available = Boolean(state.appUpdate?.supported && state.appUpdate?.available);
       const label = state.appUpdateInstalling
