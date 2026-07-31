@@ -1075,6 +1075,29 @@ impl TelemetryStore {
         Ok(())
     }
 
+    pub fn queue_all_operation_uploads(&self) -> Result<usize, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "Telemetry database lock poisoned".to_string())?;
+        connection
+            .execute(
+                "UPDATE operation_index SET upload_state = 'pending'
+                 WHERE upload_state NOT IN ('uploaded', 'uploading')",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM operation_index
+                 WHERE upload_state IN ('pending', 'retry')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count.max(0) as usize)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn claim_operation_upload(
         &self,
         trace_id_hex: &str,
@@ -2227,6 +2250,42 @@ mod tests {
 
         drop(selected);
         drop(ignored);
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn queues_all_completed_operations_without_reuploading_or_truncating_running_records() {
+        let path = test_path("all-operation-upload");
+        let store = TelemetryStore::open(&path).unwrap();
+        let first = test_operation(&store);
+        first.finish_ok().unwrap();
+        let first_trace_id = first.trace_id().to_vec();
+        let second = test_operation(&store);
+        second.finish_error("failed").unwrap();
+        let running = test_operation(&store);
+
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE operation_index SET upload_state = 'uploaded' WHERE trace_id = ?1",
+                params![first_trace_id],
+            )
+            .unwrap();
+
+        assert_eq!(store.queue_all_operation_uploads().unwrap(), 2);
+        let queued = store.claim_next_operation_upload().unwrap().unwrap();
+        assert_eq!(queued.trace_id, second.trace_id());
+        assert!(store.claim_next_operation_upload().unwrap().is_none());
+        running.finish_ok().unwrap();
+        let queued = store.claim_next_operation_upload().unwrap().unwrap();
+        assert_eq!(queued.trace_id, running.trace_id());
+
+        drop(running);
+        drop(second);
+        drop(first);
         drop(store);
         let _ = fs::remove_file(path);
     }

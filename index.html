@@ -704,9 +704,8 @@
       </header>
       <div class="source-list" id="source-list" aria-live="polite"></div>
       <footer class="source-footer">
-        <span class="source-footer-dot"></span>
-        <div class="source-footer-copy"><strong id="platform-label">正在连接本机服务</strong><small id="version-label">AgentDock</small></div>
-        <button class="source-update-button" id="app-update-button" data-action="install-app-update" hidden><i data-lucide="arrow-up-circle"></i><span>更新</span></button>
+        <div class="source-version-row" aria-live="polite"><span id="current-version-label">当前版本</span><strong id="version-label">--</strong></div>
+        <button class="source-update-button" id="app-update-button" data-action="check-app-update" title="检测 AgentDock 最新版本" aria-label="检测 AgentDock 最新版本"><i data-lucide="refresh-cw"></i><span>检测最新版</span></button>
       </footer>
     </aside>
 
@@ -716,7 +715,7 @@
         <label class="command-search"><i data-lucide="search"></i><input id="command-search" type="search" placeholder="筛选当前列表" aria-label="筛选当前列表" /><kbd>Ctrl K</kbd></label>
         <div class="top-actions">
           <span class="badge preview-notice">预览模式</span>
-          <span class="badge" id="backend-state"><i data-lucide="loader-circle"></i>正在检测</span>
+          <button class="btn top-report-button" data-action="report-all-operations" title="上报全部执行日志用于异常分析"><i data-lucide="cloud-upload"></i><span>上报异常</span></button>
           <button class="icon-btn" data-action="refresh-all" title="刷新全部状态" aria-label="刷新全部状态"><i data-lucide="refresh-cw"></i></button>
         </div>
       </header>
@@ -1455,6 +1454,7 @@
       if (command === "get_desktop_status") return structuredClone(mock.status);
       if (command === "check_app_update") return structuredClone(mock.appUpdate);
       if (command === "install_app_update") { await new Promise((resolve) => setTimeout(resolve, 1400)); return null; }
+      if (command === "report_all_operation_records") return { queuedCount: 12, configured: true, message: "已提交 12 条执行日志，正在后台上报" };
       if (command === "get_app_settings") return structuredClone(mock.settings);
       if (command === "save_app_settings") { mock.settings = structuredClone(args.settings); if (!mock.settings.launchOnStartup) mock.settings.silentStartup = false; return structuredClone(mock.settings); }
       if (command === "list_software_catalog") return structuredClone(mock.softwareCatalog);
@@ -1660,6 +1660,11 @@
         setText(`[data-view-button="${view}"] .label`, label); if (button) button.title = label;
       }
       const settingsButton = document.querySelector('[data-view-button="settings"]'); if (settingsButton) { const label = tr("nav.settings", "设置"); settingsButton.title = label; settingsButton.setAttribute("aria-label", label); }
+      const reportButton = document.querySelector('[data-action="report-all-operations"]');
+      if (reportButton) {
+        reportButton.querySelector("span").textContent = tr("telemetry.reportIssue", "上报异常");
+        reportButton.title = tr("telemetry.reportIssueHint", "上报全部执行日志用于异常分析");
+      }
       const [topTitle, topSubtitle] = localizedViewMeta(state.activeView); setText("#top-title", topTitle); setText("#top-subtitle", topSubtitle);
 
       const pageCopy = {
@@ -1862,18 +1867,29 @@
     let appUpdateCheckTimer = null;
     let lastAppUpdateCheckAt = 0;
 
-    async function checkForAppUpdate({ force = false } = {}) {
+    async function checkForAppUpdate({ force = false, announce = false } = {}) {
       if (state.appUpdateChecking || state.appUpdateInstalling) return;
       if (!force && Date.now() - lastAppUpdateCheckAt < APP_UPDATE_CHECK_INTERVAL_MS) return;
       state.appUpdateChecking = true;
       lastAppUpdateCheckAt = Date.now();
+      renderAppUpdate(); refreshIcons();
       try {
         state.appUpdate = await call("check_app_update");
-        renderAppUpdate(); refreshIcons();
+        if (announce) {
+          const message = !state.appUpdate.supported
+            ? tr("appUpdate.unsupported", "当前平台不支持自动更新")
+            : state.appUpdate.available
+              ? trf("appUpdate.available", "发现新版本 {version}", { version: state.appUpdate.latestVersion || "" })
+              : tr("appUpdate.latest", "当前已是最新版");
+          notify(message);
+        }
       } catch (error) {
-        addLog("warn", trf("appUpdate.checkFailed", "检查 AgentDock 更新失败：{error}", { error: errorText(error) }));
+        const message = trf("appUpdate.checkFailed", "检查 AgentDock 更新失败：{error}", { error: errorText(error) });
+        addLog("warn", message);
+        if (announce) notify(message, "error");
       } finally {
         state.appUpdateChecking = false;
+        renderAppUpdate(); refreshIcons();
       }
     }
 
@@ -1902,6 +1918,17 @@
       } finally {
         state.appUpdateInstalling = false; renderAppUpdate(); refreshIcons();
       }
+    }
+
+    async function reportAllOperations() {
+      const result = await call("report_all_operation_records");
+      const message = !result.configured
+        ? tr("telemetry.notConfigured", "遥测上报配置尚未写入安装包，执行日志已保留")
+        : result.queuedCount
+          ? trf("telemetry.reportQueued", "已提交 {count} 条执行日志，正在后台上报", { count: result.queuedCount })
+          : tr("telemetry.reportCurrent", "执行日志均已上报，异常记录已提交检查");
+      addLog("info", message);
+      notify(message);
     }
 
     function visibleClientIds() {
@@ -2076,25 +2103,33 @@
     function renderAll() { renderHeader(); renderClients(); renderSoftware(); renderSkills(); renderMcp(); renderStats(); renderLogs(); renderOperationRecords(); renderSettings(); renderSourceSidebar(); refreshIcons(); }
     function renderAppUpdate() {
       const button = document.getElementById("app-update-button");
-      const visible = Boolean(state.appUpdateInstalling || (state.appUpdate?.supported && state.appUpdate?.available));
-      button.hidden = !visible;
-      if (!visible) return;
+      document.getElementById("current-version-label").textContent = tr("appUpdate.currentVersion", "当前版本");
+      document.getElementById("version-label").textContent = state.status?.appVersion || state.appUpdate?.currentVersion || "--";
       const version = state.appUpdate?.latestVersion || "";
-      const label = state.appUpdateInstalling ? tr("appUpdate.installing", "正在升级") : trf("appUpdate.updateTo", "更新到 {version}", { version });
-      button.disabled = state.appUpdateInstalling;
-      button.title = state.appUpdateInstalling ? label : trf("appUpdate.restartHint", "升级到 {version} 并自动重启", { version });
+      const available = Boolean(state.appUpdate?.supported && state.appUpdate?.available);
+      const label = state.appUpdateInstalling
+        ? tr("appUpdate.installing", "正在升级")
+        : state.appUpdateChecking
+          ? tr("appUpdate.checking", "正在检测")
+          : available
+            ? trf("appUpdate.updateTo", "更新到 {version}", { version })
+            : tr("appUpdate.checkLatest", "检测最新版");
+      button.dataset.action = available && !state.appUpdateChecking ? "install-app-update" : "check-app-update";
+      button.disabled = state.appUpdateInstalling || state.appUpdateChecking;
+      button.title = state.appUpdateInstalling
+        ? label
+        : available
+          ? trf("appUpdate.restartHint", "升级到 {version} 并自动重启", { version })
+          : tr("appUpdate.checkHint", "检测 AgentDock 最新版本");
       button.setAttribute("aria-label", button.title);
-      button.innerHTML = `<i class="${state.appUpdateInstalling ? "spin" : ""}" data-lucide="${state.appUpdateInstalling ? "loader-circle" : "arrow-up-circle"}"></i><span>${escapeHtml(label)}</span>`;
+      const busy = state.appUpdateInstalling || state.appUpdateChecking;
+      button.innerHTML = `<i class="${busy ? "spin" : ""}" data-lucide="${busy ? "loader-circle" : available ? "arrow-up-circle" : "refresh-cw"}"></i><span>${escapeHtml(label)}</span>`;
     }
     function renderHeader() {
       const visible = visibleClientIds();
       const installed = state.status?.clients?.filter((client) => visible.includes(client.id) && client.installed).length || 0;
       const total = visible.length;
       const detecting = state.backgroundRefreshing || !state.status;
-      document.getElementById("backend-state").className = `badge ${detecting ? "" : "ok"}`;
-      document.getElementById("backend-state").innerHTML = `<i class="${detecting ? "spin" : ""}" data-lucide="${detecting ? "loader-circle" : "circle-check"}"></i>${detecting ? tr("正在检测本机客户端", "正在检测本机客户端") : tr("status.connected", "本机服务已连接")}`;
-      document.getElementById("platform-label").textContent = `${state.status?.platform || tr("本机", "本机")} · ${detecting ? tr("正在检测", "正在检测") : tr("status.deviceConnected", "已连接")}`;
-      document.getElementById("version-label").textContent = `AgentDock ${state.status?.appVersion || ""}`;
       renderAppUpdate();
       document.getElementById("nav-client-count").textContent = `${state.status ? installed : "--"}/${total}`;
       document.getElementById("nav-software-count").textContent = state.softwareCatalog.filter((item) => item.installed).length;
@@ -3451,6 +3486,8 @@
     async function handleAction(action, button) {
       const id = button.dataset.id;
       if (action === "install-app-update") return installAppUpdate();
+      if (action === "check-app-update") return checkForAppUpdate({ force: true, announce: true });
+      if (action === "report-all-operations") return withBusy(button, reportAllOperations);
       if (action === "confirm-cancel") return closeConfirm(false);
       if (action === "confirm-accept") return closeConfirm(true);
       if (action === "context-action") return handleAction({ clients: "refresh-all", software: "refresh-catalog", skills: "refresh-skills", mcp: "new-mcp", stats: "refresh-stats", logs: "run-diagnostics", operations: "refresh-operation-records", settings: "refresh-settings" }[state.activeView], button);
@@ -3665,7 +3702,7 @@
       applyAppearance(); renderAll(); addLog("info", state.desktop ? "正在连接 AgentDock 本机服务" : "已进入浏览器交互预览模式");
       await new Promise((resolve) => requestAnimationFrame(() => resolve()));
       try { await loadAll({ quiet: true }); addLog("ok", `AgentDock ${state.status.appVersion} 已启动`); startAppUpdateChecks(); const ccSwitchChecked = ccSwitchInitialCheckCompleted(); await rememberCcSwitchInitialCheck(); if (!ccSwitchChecked) void checkCcSwitchImport(); }
-      catch (error) { const message = errorText(error); document.getElementById("backend-state").className = "badge danger"; document.getElementById("backend-state").innerHTML = `<i data-lucide="circle-x"></i>${tr("本机服务连接失败", "本机服务连接失败")}`; addLog("error", message); notify(message, "error"); refreshIcons(); }
+      catch (error) { const message = errorText(error); addLog("error", message); notify(message, "error"); refreshIcons(); }
     }
     boot();
   </script>

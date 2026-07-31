@@ -806,6 +806,13 @@ async fn report_operation_record(
 }
 
 #[tauri::command]
+fn report_all_operation_records() -> Result<otlp_upload::AllOperationsReportResult, String> {
+    let dirs = agentdock_dirs()?;
+    let store = telemetry_store(&dirs)?;
+    otlp_upload::report_all_operations(store)
+}
+
+#[tauri::command]
 async fn record_frontend_exception(input: FrontendExceptionInput) -> Result<(), String> {
     let input = normalize_frontend_exception(input)?;
     tauri::async_runtime::spawn_blocking(move || {
@@ -10635,6 +10642,7 @@ pub fn run() {
             get_operation_record,
             get_operation_output,
             report_operation_record,
+            report_all_operation_records,
             record_frontend_exception,
             check_app_update,
             install_app_update,

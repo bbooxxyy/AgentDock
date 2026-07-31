@@ -171,6 +171,14 @@ pub struct OperationReportResult {
     pub message: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllOperationsReportResult {
+    pub queued_count: usize,
+    pub configured: bool,
+    pub message: String,
+}
+
 trait TelemetryTransport: Send + Sync {
     fn send<'a>(&'a self, request: SkywalkingRequest) -> BoxFuture<'a, Result<(), String>>;
 }
@@ -278,7 +286,8 @@ pub fn start_background_uploader(
         let transport = SkywalkingGrpcTransport;
         tokio::time::sleep(Duration::from_secs(1)).await;
         loop {
-            if let Err(error) = upload_next_operation(store.as_ref(), &config, &transport).await {
+            if let Err(error) = upload_pending_operations(store.as_ref(), &config, &transport).await
+            {
                 eprintln!("AgentDock: SkyWalking operation upload skipped: {error}");
             }
             if let Err(error) =
@@ -318,6 +327,63 @@ pub async fn report_operation(
             queued: true,
             message: format!("上报失败，已进入重试队列：{error}"),
         }),
+    }
+}
+
+pub fn report_all_operations(
+    store: Arc<crate::telemetry::TelemetryStore>,
+) -> Result<AllOperationsReportResult, String> {
+    let queued_count = store.queue_all_operation_uploads()?;
+    let Some(config) = packaged_config()? else {
+        return Ok(AllOperationsReportResult {
+            queued_count,
+            configured: false,
+            message: "遥测上报配置尚未写入安装包，执行日志已保留".to_string(),
+        });
+    };
+    let upload_store = Arc::clone(&store);
+    tauri::async_runtime::spawn(async move {
+        let transport = SkywalkingGrpcTransport;
+        if let Err(error) =
+            upload_pending_operations(upload_store.as_ref(), &config, &transport).await
+        {
+            eprintln!("AgentDock: SkyWalking operation upload skipped: {error}");
+        }
+        if let Err(error) =
+            upload_once_at(upload_store.as_ref(), &config, &transport, unix_nanos()).await
+        {
+            eprintln!("AgentDock: SkyWalking telemetry upload skipped: {error}");
+        }
+    });
+    let message = if queued_count == 0 {
+        "执行日志均已上报，异常记录已提交检查".to_string()
+    } else {
+        format!("已提交 {queued_count} 条执行日志，正在后台上报")
+    };
+    Ok(AllOperationsReportResult {
+        queued_count,
+        configured: true,
+        message,
+    })
+}
+
+async fn upload_pending_operations<T: TelemetryTransport + ?Sized>(
+    store: &crate::telemetry::TelemetryStore,
+    config: &OtlpConfig,
+    transport: &T,
+) -> Result<UploadCycleResult, String> {
+    let mut uploaded = 0;
+    loop {
+        match upload_next_operation(store, config, transport).await? {
+            UploadCycleResult::NoRecords => {
+                return Ok(if uploaded == 0 {
+                    UploadCycleResult::NoRecords
+                } else {
+                    UploadCycleResult::Uploaded(uploaded)
+                });
+            }
+            UploadCycleResult::Uploaded(count) => uploaded += count,
+        }
     }
 }
 
