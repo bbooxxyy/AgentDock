@@ -14881,7 +14881,7 @@ mod tests {
 
         assert_eq!(
             skill_path_identity(&preferred_skill_copy_source(&skill).unwrap()),
-            skill_path_identity(&real)
+            skill_path_identity(&fs::canonicalize(&real).unwrap())
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -14922,7 +14922,7 @@ mod tests {
 
         assert_eq!(
             skill_path_identity(&preferred_skill_copy_source(&skill).unwrap()),
-            skill_path_identity(&agents)
+            skill_path_identity(&fs::canonicalize(&agents).unwrap())
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -17166,7 +17166,7 @@ requires_openai_auth = true"#;
             let mut command = Command::new("sh");
             command.args([
                 "-c",
-                "printf 'downloading 10%\\n\\033[32mDone!\\033[39m Review skills before use\\n'; printf 'warning' >&2",
+                "printf '%s\\n%b\\n' 'downloading 10%' '\\033[32mDone!\\033[39m Review skills before use'; printf '%s' 'warning' >&2",
             ]);
             command
         };
