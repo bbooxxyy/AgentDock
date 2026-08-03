@@ -1293,7 +1293,7 @@
       const cached = JSON.parse(localStorage.getItem(STARTUP_CACHE_KEY) || "null");
       if (cached?.version === 3 && cached.data && Date.now() - Number(cached.savedAt || 0) < 30 * 24 * 60 * 60 * 1000) startupCache = cached.data;
     } catch {}
-    const defaultSettings = { language: document.documentElement.lang || "zh-CN", theme: cachedTheme, ccSwitchInitialCheckCompleted: false, launchOnStartup: false, silentStartup: false, minimizeToTrayOnClose: false, preferredTerminal: "terminal", visibleClients: [...APP_ORDER], clientOrder: [...APP_ORDER], currentWorkingDirectory: "", recentWorkingDirectories: [], skillApiProxyEnabled: true };
+    const defaultSettings = { language: document.documentElement.lang || "zh-CN", theme: cachedTheme, ccSwitchInitialCheckCompleted: false, launchOnStartup: false, silentStartup: false, minimizeToTrayOnClose: false, preferredTerminal: "terminal", visibleClients: [...APP_ORDER], clientOrder: [...APP_ORDER], currentWorkingDirectory: "", recentWorkingDirectories: [], customClientExecutables: {}, skillApiProxyEnabled: true };
 
     const state = {
       desktop: Boolean(window.__TAURI_INTERNALS__), status: startupCache?.status || null, settings: { ...defaultSettings, ...(startupCache?.settings || {}), language: defaultSettings.language, theme: defaultSettings.theme }, ready: startupCache?.ready || null, providers: startupCache?.providers || [], skills: startupCache?.skills || [], mcpServers: startupCache?.mcpServers || [], softwareCatalog: startupCache?.softwareCatalog || [], appUpdate: null, appUpdateChecking: false, appUpdateInstalling: false, backgroundRefreshing: false,
@@ -1311,7 +1311,7 @@
     const mock = {
       status: {
         appVersion: "0.1.21", platform: "browser-preview", dataDir: "/AgentDock/AgentDock", configDir: "/AgentDock/config", homeDir: "/Users/demo", managedRuntimeReady: true,
-        clients: APP_ORDER.map((id) => { const installed = ["codex", "claude-desktop", "grok", "hermes"].includes(id); return { id, name: APP_META[id].name, installed, version: installed ? id === "codex" ? "0.91.0" : "detected" : null, executable: installed ? `/Applications/${id}` : null, configPath: installed ? `/AgentDock/${id}/config` : null, managedByAgentdock: id === "codex" }; })
+        clients: APP_ORDER.map((id) => { const installed = ["codex", "claude-desktop", "grok", "hermes"].includes(id); return { id, name: APP_META[id].name, installed, version: installed ? id === "codex" ? "0.91.0" : "detected" : null, executable: installed ? `/Applications/${id}` : null, configPath: installed ? `/AgentDock/${id}/config` : null, managedByAgentdock: id === "codex", customExecutable: false, desktopApp: id === "claude-desktop", detectionSource: id === "codex" ? "agentdock" : "path" }; })
       },
       appUpdate: { supported: true, available: true, currentVersion: "0.1.21", latestVersion: "0.1.22", downloadSize: 12582912 },
       ccSwitchImport: { available: true, sourcePath: "~/.cc-switch/cc-switch.db", sourceKind: "SQLite", fingerprint: "browser-preview-cc-switch", providerCount: 4, appCounts: { "claude-code": 2, codex: 1, antigravity: 1 } },
@@ -1355,7 +1355,7 @@
     const errorText = (error) => typeof error === "string" ? error : error?.message || String(error);
     const clientMeta = (id) => APP_META[id] || { name: id, short: id.slice(0, 2).toUpperCase(), logo: "/client-logos/codex.svg", autoInstall: false };
     const selectedClient = () => state.status?.clients.find((client) => client.id === state.activeClient);
-    const clientUsesWorkingDirectory = (client) => client?.id !== "claude-desktop" && !String(client?.executable || "").toLowerCase().endsWith(".app");
+    const clientUsesWorkingDirectory = (client) => client?.id !== "claude-desktop" && !client?.desktopApp && !String(client?.executable || "").toLowerCase().endsWith(".app");
     const directoryName = (path) => cleanDisplayPath(path).split(/[\\/]/).filter(Boolean).at(-1) || cleanDisplayPath(path);
     const launchRequestId = () => globalThis.crypto?.randomUUID?.() || `launch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const clientLogo = (id, extra = "") => { const meta = clientMeta(id); return `<img class="client-logo logo-${escapeHtml(id)} ${extra}" src="${meta.logo}" alt="${escapeHtml(meta.name)} Logo" />`; };
@@ -1457,6 +1457,18 @@
       if (command === "report_all_operation_records") return { queuedCount: 12, configured: true, message: "已提交 12 条执行日志，正在后台上报" };
       if (command === "get_app_settings") return structuredClone(mock.settings);
       if (command === "save_app_settings") { mock.settings = structuredClone(args.settings); if (!mock.settings.launchOnStartup) mock.settings.silentStartup = false; return structuredClone(mock.settings); }
+      if (command === "set_custom_client_executable") {
+        const client = mock.status.clients.find((item) => item.id === args.clientId);
+        if (!client) throw new Error("未找到客户端");
+        if (args.executable) {
+          client.installed = true; client.executable = args.executable; client.customExecutable = true; client.detectionSource = "manual";
+          mock.settings.customClientExecutables[args.clientId] = args.executable;
+        } else {
+          client.installed = false; client.executable = null; client.customExecutable = false; client.detectionSource = "";
+          delete mock.settings.customClientExecutables[args.clientId];
+        }
+        return structuredClone(client);
+      }
       if (command === "list_software_catalog") return structuredClone(mock.softwareCatalog);
       if (command === "detect_cc_switch_config") return structuredClone(mock.ccSwitchImport);
       if (command === "import_cc_switch_config") {
@@ -2003,6 +2015,27 @@
       return rememberWorkingDirectory(selected);
     }
 
+    async function chooseClientExecutable(clientId) {
+      const name = clientMeta(clientId).name;
+      const selected = state.desktop ? await openDialog({
+        directory: false,
+        multiple: false,
+        title: trf("client.executablePickerTitle", "定位 {name} 的可执行文件", { name }),
+        filters: [{ name: tr("Windows 可执行文件", "Windows 可执行文件"), extensions: ["exe", "cmd", "bat", "com"] }]
+      }) : `C:\\Tools\\${clientId}.exe`;
+      if (!selected || Array.isArray(selected)) return;
+      await call("set_custom_client_executable", { clientId, executable: selected });
+      await loadAll({ quiet: true });
+      notify(trf("client.executableLinked", "已关联 {name} 的现有安装", { name }));
+    }
+
+    async function clearClientExecutable(clientId) {
+      const name = clientMeta(clientId).name;
+      await call("set_custom_client_executable", { clientId, executable: null });
+      await loadAll({ quiet: true });
+      notify(trf("client.executableUnlinked", "已取消 {name} 的手动关联", { name }));
+    }
+
     async function runClientLaunch(clientId) {
       if (state.launchingClients.has(clientId)) { notify(tr("该操作正在进行中", "该操作正在进行中")); return; }
       const client = state.status?.clients.find((item) => item.id === clientId);
@@ -2179,11 +2212,14 @@
       const enabledMcp = state.mcpServers.filter((server) => server.enabled && server.apps?.includes(state.activeClient)).length;
       const currentModel = currentProvider ? providerDefaultModel(currentProvider) || tr("跟随客户端", "跟随客户端") : tr("尚未配置", "尚未配置");
       const clientName = escapeHtml(meta.name);
+      const canLocateExecutable = state.status?.platform === "windows";
+      const locateAction = canLocateExecutable ? `<button class="btn" data-action="locate-client-executable" data-id="${client.id}" ${operation ? "disabled" : ""}><i data-lucide="folder-search-2"></i>${tr("定位现有安装", "定位现有安装")}</button>` : "";
       const clientActions = client.installed ? `
         ${client.configPath ? `<button class="icon-btn" data-action="open-path" data-path="${escapeHtml(client.configPath)}" title="${tr("打开配置位置", "打开配置位置")}" aria-label="${tr("打开配置位置", "打开配置位置")}"><i data-lucide="folder-open"></i></button>` : ""}
         ${(operation?.mode === "update" || catalog?.updateAvailable && catalog.installSupported) ? `<button class="btn" data-action="install-client" data-id="${client.id}" ${operation ? "disabled" : ""}><i class="${operation ? "spin" : ""}" data-lucide="${operation ? "loader-circle" : "arrow-up-circle"}"></i>${operation ? clientOperationLabel(operation) : trf("client.updateTo", "更新到 {version}", { version: escapeHtml(catalog.latestVersion || tr("最新版", "最新版")) })}</button>` : ""}
         <button class="icon-btn" data-action="refresh-catalog" title="${trf("client.checkUpdate", "检查 {name} 更新", { name: clientName })}" aria-label="${trf("client.checkUpdate", "检查 {name} 更新", { name: clientName })}" ${operation ? "disabled" : ""}><i data-lucide="refresh-cw"></i></button>
-        ${client.managedByAgentdock ? `<button class="icon-btn" data-action="uninstall-client" data-id="${client.id}" title="${tr("卸载", "卸载")}" aria-label="${trf("client.uninstall", "卸载 {name}", { name: clientName })}" ${operation ? "disabled" : ""}><i data-lucide="trash-2"></i></button>` : ""}` : meta.autoInstall ? `<button class="btn primary" data-action="install-client" data-id="${client.id}" ${operation ? "disabled" : ""}><i class="${operation ? "spin" : ""}" data-lucide="${operation ? "loader-circle" : "download"}"></i>${operation ? clientOperationLabel(operation) : trf("client.install", "一键安装 {name}", { name: clientName })}</button>` : `<span class="badge">${tr("当前仅支持本机检测", "当前仅支持本机检测")}</span>`;
+        ${client.customExecutable ? `<button class="icon-btn" data-action="clear-client-executable" data-id="${client.id}" title="${tr("取消手动关联", "取消手动关联")}" aria-label="${trf("client.unlinkExecutable", "取消 {name} 的手动关联", { name: clientName })}" ${operation ? "disabled" : ""}><i data-lucide="unlink"></i></button>` : ""}
+        ${client.managedByAgentdock ? `<button class="icon-btn" data-action="uninstall-client" data-id="${client.id}" title="${tr("卸载", "卸载")}" aria-label="${trf("client.uninstall", "卸载 {name}", { name: clientName })}" ${operation ? "disabled" : ""}><i data-lucide="trash-2"></i></button>` : ""}` : `${meta.autoInstall ? `<button class="btn primary" data-action="install-client" data-id="${client.id}" ${operation ? "disabled" : ""}><i class="${operation ? "spin" : ""}" data-lucide="${operation ? "loader-circle" : "download"}"></i>${operation ? clientOperationLabel(operation) : trf("client.install", "一键安装 {name}", { name: clientName })}</button>` : `<span class="badge">${tr("当前仅支持本机检测", "当前仅支持本机检测")}</span>`}${locateAction}`;
       stage.innerHTML = `
         <div class="client-stage-head"><div class="client-identity">${clientLogo(client.id)}<div><h3>${clientName}</h3><p>${client.installed ? `${escapeHtml(client.version || tr("已安装", "已安装"))}${client.managedByAgentdock ? tr("client.managed", " · AgentDock 托管") : tr("client.systemInstall", " · 本机安装")}` : tr("未检测到可执行程序", "未检测到可执行程序")}</p></div></div><div class="client-stage-actions">${clientActions}</div></div>
         ${client.installed ? renderClientLaunchbar(client, clientName, operation) : ""}
@@ -2192,7 +2228,7 @@
           <div class="readiness-item"><span class="readiness-icon ${usableProviders.length ? "" : "warn"}"><i data-lucide="key-round"></i></span><div><strong>${trf("count.providers", "{count} 个供应商", { count: usableProviders.length })}</strong><small>${currentProvider ? trf("provider.current", "当前使用 {name}", { name: escapeHtml(currentProvider.name) }) : tr("添加供应商后即可调用模型", "添加供应商后即可调用模型")}</small></div></div>
           <div class="readiness-item"><span class="readiness-icon ${enabledMcp ? "" : "muted"}"><i data-lucide="blocks"></i></span><div><strong>${trf("count.mcp", "{count} 个 MCP", { count: enabledMcp })}</strong><small>${enabledMcp ? trf("mcp.syncedTo", "已同步到 {name}", { name: clientName }) : tr("可在 MCP 页面启用扩展工具", "可在 MCP 页面启用扩展工具")}</small></div></div>
         </section>
-        ${client.installed ? `<section class="client-section"><div class="provider-section-head"><div><h3>${tr("供应商", "供应商")}</h3><p>${providers.length ? trf("provider.configured", "已配置 {count} 个，使用操作会立即写入 {name}", { count: providers.length, name: clientName }) : tr("还没有配置供应商", "还没有配置供应商")}</p></div><button class="btn primary" data-action="open-provider-editor"><i data-lucide="plus"></i>${tr("添加供应商", "添加供应商")}</button></div><div class="provider-list" id="provider-list">${providerCards(providers)}</div></section><section class="client-config-summary"><header><div><h3>${tr("配置摘要", "配置摘要")}</h3><p>${tr("由 AgentDock 管理并写入真实客户端配置", "由 AgentDock 管理并写入真实客户端配置")}</p></div>${client.configPath ? `<button class="btn text" data-action="open-path" data-path="${escapeHtml(client.configPath)}"><i data-lucide="external-link"></i>${tr("查看完整文件", "查看完整文件")}</button>` : `<span class="badge">${tr("等待生成", "等待生成")}</span>`}</header><div class="client-config-values"><span><small>${tr("配置位置", "配置位置")}</small><code>${escapeHtml(client.configPath || tr("安装后自动创建", "安装后自动创建"))}</code></span><span><small>${tr("默认模型", "默认模型")}</small><code>${escapeHtml(currentModel)}</code></span><span><small>${tr("API 协议", "API 协议")}</small><code>${escapeHtml(currentProvider?.apiFormat || tr("跟随供应商", "跟随供应商"))}</code></span></div></section>` : `<div class="client-empty"><div><span class="empty-symbol"><i data-lucide="download"></i></span><h3>${trf("client.notInstalled", "{name} 尚未安装", { name: clientName })}</h3><p>${meta.autoInstall ? tr("AgentDock 会优先使用国内可用镜像，自动回退备用源并校验官方包完整性。", "AgentDock 会优先使用国内可用镜像，自动回退备用源并校验官方包完整性。") : tr("安装后重新扫描即可配置供应商。", "安装后重新扫描即可配置供应商。")}</p>${meta.autoInstall ? `<button class="btn primary" data-action="install-client" data-id="${client.id}" ${operation ? "disabled" : ""}><i class="${operation ? "spin" : ""}" data-lucide="${operation ? "loader-circle" : "download"}"></i>${operation ? clientOperationLabel(operation) : tr("一键安装", "一键安装")}</button>` : ""}</div></div>`}
+        ${client.installed ? `<section class="client-section"><div class="provider-section-head"><div><h3>${tr("供应商", "供应商")}</h3><p>${providers.length ? trf("provider.configured", "已配置 {count} 个，使用操作会立即写入 {name}", { count: providers.length, name: clientName }) : tr("还没有配置供应商", "还没有配置供应商")}</p></div><button class="btn primary" data-action="open-provider-editor"><i data-lucide="plus"></i>${tr("添加供应商", "添加供应商")}</button></div><div class="provider-list" id="provider-list">${providerCards(providers)}</div></section><section class="client-config-summary"><header><div><h3>${tr("配置摘要", "配置摘要")}</h3><p>${tr("由 AgentDock 管理并写入真实客户端配置", "由 AgentDock 管理并写入真实客户端配置")}</p></div>${client.configPath ? `<button class="btn text" data-action="open-path" data-path="${escapeHtml(client.configPath)}"><i data-lucide="external-link"></i>${tr("查看完整文件", "查看完整文件")}</button>` : `<span class="badge">${tr("等待生成", "等待生成")}</span>`}</header><div class="client-config-values"><span><small>${tr("配置位置", "配置位置")}</small><code>${escapeHtml(client.configPath || tr("安装后自动创建", "安装后自动创建"))}</code></span><span><small>${tr("默认模型", "默认模型")}</small><code>${escapeHtml(currentModel)}</code></span><span><small>${tr("API 协议", "API 协议")}</small><code>${escapeHtml(currentProvider?.apiFormat || tr("跟随供应商", "跟随供应商"))}</code></span></div></section>` : `<div class="client-empty"><div><span class="empty-symbol"><i data-lucide="download"></i></span><h3>${trf("client.notInstalled", "{name} 尚未安装", { name: clientName })}</h3><p>${meta.autoInstall ? tr("AgentDock 会优先使用国内可用镜像，自动回退备用源并校验官方包完整性。", "AgentDock 会优先使用国内可用镜像，自动回退备用源并校验官方包完整性。") : tr("安装后重新扫描即可配置供应商。", "安装后重新扫描即可配置供应商。")}</p><div class="actions">${meta.autoInstall ? `<button class="btn primary" data-action="install-client" data-id="${client.id}" ${operation ? "disabled" : ""}><i class="${operation ? "spin" : ""}" data-lucide="${operation ? "loader-circle" : "download"}"></i>${operation ? clientOperationLabel(operation) : tr("一键安装", "一键安装")}</button>` : ""}${locateAction}</div></div></div>`}
       `;
     }
 
@@ -3523,6 +3559,8 @@
       if (action === "refresh-catalog") return withBusy(button, async () => { state.softwareCatalog = await call("list_software_catalog"); renderHeader(); renderClients(); renderSoftware(); renderSourceSidebar(); refreshIcons(); notify(tr("action.catalogRefreshed", "版本信息已更新")); });
       if (action === "quick-setup") return withBusy(button, async () => { for (const clientId of ["codex", "claude-code"]) if (!state.status.clients.some((client) => client.id === clientId && client.installed)) { const result = await call("install_client", { clientId }); addLog("ok", result.message); } await loadAll({ quiet: true }); notify(tr("推荐客户端已处理", "推荐客户端已处理")); });
       if (action === "install-client") return runClientInstall(id);
+      if (action === "locate-client-executable") return withBusy(button, () => chooseClientExecutable(id));
+      if (action === "clear-client-executable") return withBusy(button, () => clearClientExecutable(id));
       if (action === "launch-client") return runClientLaunch(String(id));
       if (action === "toggle-workspace-menu") { state.workspaceMenuOpen = !state.workspaceMenuOpen; renderClientStage(); refreshIcons(); return; }
       if (action === "choose-working-directory") { state.workspaceMenuOpen = false; renderClientStage(); refreshIcons(); return chooseWorkingDirectory(); }

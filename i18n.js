@@ -547,6 +547,13 @@ const rows = [
   ,["confirm.unsavedProviderMessage", "{current} 的供應商設定尚未儲存。切換至 {next} 後，這些變更將會遺失。", "The provider configuration for {current} has not been saved. Switching to {next} will discard these changes.", "{current} のプロバイダー設定は保存されていません。{next} に切り替えると、これらの変更は失われます。", "Die Anbieterkonfiguration für {current} wurde nicht gespeichert. Beim Wechsel zu {next} gehen diese Änderungen verloren."]
   ,["confirm.discardAndSwitch", "放棄並切換", "Discard and switch", "破棄して切り替える", "Verwerfen und wechseln"]
   ,["客户端不支持", "客戶端不支援", "Unsupported by client", "クライアント未対応", "Vom Client nicht unterstützt"]
+  ,["定位现有安装", "尋找現有安裝", "Locate existing installation", "既存のインストールを指定", "Vorhandene Installation auswählen"]
+  ,["Windows 可执行文件", "Windows 可執行檔", "Windows executable", "Windows 実行ファイル", "Windows-Programmdatei"]
+  ,["取消手动关联", "取消手動關聯", "Remove manual link", "手動リンクを解除", "Manuelle Verknüpfung entfernen"]
+  ,["client.executablePickerTitle", "選擇 {name} 的可執行檔", "Select the {name} executable", "{name} の実行ファイルを選択", "Programmdatei für {name} auswählen"]
+  ,["client.executableLinked", "已關聯 {name} 的現有安裝", "Linked the existing {name} installation", "既存の {name} インストールを関連付けました", "Vorhandene {name}-Installation wurde verknüpft"]
+  ,["client.executableUnlinked", "已取消 {name} 的手動關聯", "Removed the manual link for {name}", "{name} の手動リンクを解除しました", "Manuelle Verknüpfung für {name} wurde entfernt"]
+  ,["client.unlinkExecutable", "取消 {name} 的手動關聯", "Remove the manual link for {name}", "{name} の手動リンクを解除", "Manuelle Verknüpfung für {name} entfernen"]
   ,["本机服务连接失败", "本機服務連線失敗", "Local service connection failed", "ローカルサービスへの接続に失敗しました", "Verbindung zum lokalen Dienst fehlgeschlagen"]
 ];
 

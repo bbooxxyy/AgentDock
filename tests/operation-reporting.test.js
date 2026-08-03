@@ -26,3 +26,11 @@ test("source footer provides manual app update checks and keeps hourly checks", 
   assert.match(html, /window\.setInterval\(\(\) => void checkForAppUpdate\(\), APP_UPDATE_CHECK_INTERVAL_MS\)/);
   assert.doesNotMatch(html, /id="platform-label"/);
 });
+
+test("Windows clients can link and unlink an existing executable", () => {
+  assert.match(html, /state\.status\?\.platform === "windows"/);
+  assert.match(html, /data-action="locate-client-executable"/);
+  assert.match(html, /data-action="clear-client-executable"/);
+  assert.match(html, /call\("set_custom_client_executable", \{ clientId, executable: selected \}\)/);
+  assert.match(html, /call\("set_custom_client_executable", \{ clientId, executable: null \}\)/);
+});

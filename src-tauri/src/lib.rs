@@ -14,6 +14,8 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
+#[cfg(any(test, windows))]
+use std::ffi::OsStr;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::io::Write;
 use std::{
@@ -130,6 +132,7 @@ pub struct AppSettings {
     client_order: Vec<String>,
     current_working_directory: String,
     recent_working_directories: Vec<String>,
+    custom_client_executables: BTreeMap<String, String>,
     skill_storage_location: String,
     skill_sync_method: String,
     skill_api_proxy_enabled: bool,
@@ -153,6 +156,7 @@ impl Default for AppSettings {
             client_order: clients,
             current_working_directory: String::new(),
             recent_working_directories: Vec::new(),
+            custom_client_executables: BTreeMap::new(),
             skill_storage_location: "global".to_string(),
             skill_sync_method: "copy".to_string(),
             skill_api_proxy_enabled: true,
@@ -170,6 +174,18 @@ pub struct ClientStatus {
     executable: Option<String>,
     config_path: Option<String>,
     managed_by_agentdock: bool,
+    custom_executable: bool,
+    desktop_app: bool,
+    detection_source: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalClientCandidate {
+    executable: String,
+    version: Option<String>,
+    desktop_app: bool,
+    source: String,
+    custom: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1404,6 +1420,80 @@ fn save_app_settings(settings: AppSettings) -> Result<AppSettings, String> {
 
     write_json(&app_settings_path(&dirs), &settings)?;
     Ok(settings)
+}
+
+#[tauri::command]
+fn set_custom_client_executable(
+    client_id: String,
+    executable: Option<String>,
+) -> Result<ClientStatus, String> {
+    let _ = client_spec(&client_id)?;
+    let dirs = agentdock_dirs()?;
+    ensure_dirs(&dirs)?;
+    let mut settings = read_app_settings(&dirs)?;
+    if let Some(value) = executable
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let path = validate_custom_client_executable(&client_id, value)?;
+        settings
+            .custom_client_executables
+            .insert(client_id.clone(), display_path(&path));
+    } else {
+        settings.custom_client_executables.remove(&client_id);
+    }
+    write_json(&app_settings_path(&dirs), &settings)?;
+    if let Ok(mut cache) = client_detection_cache().lock() {
+        *cache = None;
+    }
+    refresh_client_detection()
+        .into_iter()
+        .find(|client| client.id == client_id)
+        .ok_or_else(|| "未找到客户端".to_string())
+}
+
+fn validate_custom_client_executable(client_id: &str, value: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("客户端可执行文件必须使用绝对路径".to_string());
+    }
+    if !path.is_file() {
+        return Err("所选客户端可执行文件不存在".to_string());
+    }
+    let file_name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let detection_names = client_detection_specs()
+        .into_iter()
+        .find(|(id, _, _)| *id == client_id)
+        .map(|(_, _, names)| names)
+        .unwrap_or_default();
+    let manual_names: &[&str] = match client_id {
+        "claude-desktop" => &["claude"],
+        "antigravity" => &["antigravity"],
+        _ => &[],
+    };
+    let accepted = detection_names.iter().chain(manual_names).any(|name| {
+        let normalized = name
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        !normalized.is_empty() && file_name.contains(&normalized)
+    });
+    if !accepted {
+        return Err(format!(
+            "所选文件名与 {} 客户端不匹配",
+            client_spec(client_id)?.name
+        ));
+    }
+    Ok(path)
 }
 
 #[tauri::command]
@@ -4615,7 +4705,7 @@ fn launch_client_inner(
         .executable
         .as_ref()
         .ok_or_else(|| "客户端还未安装".to_string())?;
-    let uses_working_directory = client_uses_working_directory(&client_id, Path::new(executable));
+    let uses_working_directory = client_uses_working_directory(&client);
     let working_directory = if uses_working_directory {
         Some(validate_working_directory(
             working_directory.as_deref().unwrap_or_default(),
@@ -4650,7 +4740,7 @@ fn launch_client_inner(
     }
 
     #[cfg(target_os = "macos")]
-    if is_macos_app_bundle(Path::new(executable)) {
+    if client.desktop_app {
         launch_macos_app_bundle(Path::new(executable))?;
     } else {
         launch_in_terminal(
@@ -4677,7 +4767,7 @@ fn launch_client_inner(
             &request_id,
         )?;
     } else {
-        launch_desktop_client(Path::new(executable))?;
+        launch_desktop_client(executable)?;
     }
 
     let working_directory_display = working_directory.as_ref().map(|path| display_path(path));
@@ -4715,23 +4805,25 @@ fn validate_launch_request(client_id: &str, request_id: &str) -> Result<(), Stri
     Ok(())
 }
 
-fn client_uses_working_directory(client_id: &str, executable: &Path) -> bool {
-    if client_id == "claude-desktop" {
-        return false;
-    }
-    #[cfg(target_os = "macos")]
-    if is_macos_app_bundle(executable) {
-        return false;
-    }
-    true
+fn client_uses_working_directory(client: &ClientStatus) -> bool {
+    client.id != "claude-desktop" && !client.desktop_app
 }
 
 #[cfg(not(target_os = "macos"))]
-fn launch_desktop_client(path: &Path) -> Result<(), String> {
-    let mut command = Command::new(path);
+fn launch_desktop_client(target: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = if target.starts_with(r"shell:AppsFolder\") {
+        let mut command = Command::new("explorer.exe");
+        command.arg(target);
+        command
+    } else {
+        Command::new(target)
+    };
+    #[cfg(not(windows))]
+    let mut command = Command::new(target);
     traced_spawn(&mut command)
         .map(|_| ())
-        .map_err(|error| format!("无法启动 {}: {}", path.display(), error))
+        .map_err(|error| format!("无法启动 {}: {}", target, error))
 }
 
 fn traced_spawn(command: &mut Command) -> Result<std::process::Child, std::io::Error> {
@@ -8404,20 +8496,11 @@ fn command_search_paths() -> Vec<PathBuf> {
             "installation/bin",
         );
         #[cfg(windows)]
-        paths.extend([
-            home.join("AppData/Roaming/npm"),
-            PathBuf::from("C:/nvm4w/nodejs"),
-        ]);
+        paths.extend(windows_known_command_paths(&home));
     }
     #[cfg(windows)]
     {
-        if let Some(nvm_symlink) = env::var_os("NVM_SYMLINK") {
-            paths.push(PathBuf::from(nvm_symlink));
-        }
-        paths.extend([
-            PathBuf::from("C:/Program Files/nodejs"),
-            PathBuf::from("C:/Program Files (x86)/nodejs"),
-        ]);
+        paths.extend(windows_registry_command_paths());
     }
     #[cfg(target_os = "macos")]
     paths.extend([
@@ -8441,6 +8524,202 @@ fn command_search_paths() -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     paths.retain(|path| seen.insert(path.clone()));
     paths
+}
+
+#[cfg(any(test, windows))]
+fn windows_known_command_paths_from_environment<F>(home: &Path, mut value: F) -> Vec<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    let roaming = value("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Roaming"));
+    let local = value("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Local"));
+    let program_data = value("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/ProgramData"));
+    let mut paths = vec![
+        home.join(".agentdock/bin"),
+        roaming.join("npm"),
+        roaming.join("yarn/bin"),
+        local.join("pnpm"),
+        local.join("Yarn/bin"),
+        local.join("Microsoft/WindowsApps"),
+        local.join("Microsoft/WinGet/Links"),
+        home.join("scoop/shims"),
+        program_data.join("scoop/shims"),
+        program_data.join("chocolatey/bin"),
+        PathBuf::from("C:/nvm4w/nodejs"),
+    ];
+    for (variable, suffix) in [
+        ("PNPM_HOME", ""),
+        ("NPM_CONFIG_PREFIX", ""),
+        ("VOLTA_HOME", "bin"),
+        ("BUN_INSTALL", "bin"),
+        ("SCOOP", "shims"),
+        ("ChocolateyInstall", "bin"),
+        ("NVM_HOME", ""),
+        ("NVM_SYMLINK", ""),
+    ] {
+        if let Some(root) = value(variable).filter(|entry| !entry.is_empty()) {
+            let root = PathBuf::from(root);
+            paths.push(if suffix.is_empty() {
+                root
+            } else {
+                root.join(suffix)
+            });
+        }
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = value(variable).filter(|entry| !entry.is_empty()) {
+            paths.push(PathBuf::from(root).join("nodejs"));
+        }
+    }
+    paths.extend([
+        PathBuf::from("C:/Program Files/nodejs"),
+        PathBuf::from("C:/Program Files (x86)/nodejs"),
+    ]);
+
+    let mut fnm_roots = vec![
+        roaming.join("fnm/node-versions"),
+        local.join("fnm/node-versions"),
+        home.join(".local/share/fnm/node-versions"),
+    ];
+    if let Some(root) = value("FNM_DIR").filter(|entry| !entry.is_empty()) {
+        fnm_roots.insert(0, PathBuf::from(root).join("node-versions"));
+    }
+    for root in fnm_roots {
+        append_version_manager_bins(&mut paths, &root, "installation");
+    }
+    paths
+}
+
+#[cfg(windows)]
+fn windows_known_command_paths(home: &Path) -> Vec<PathBuf> {
+    let (registry_values, _) = windows_registry_environment();
+    windows_known_command_paths_from_environment(home, |name| {
+        registry_values
+            .get(&name.to_ascii_lowercase())
+            .cloned()
+            .or_else(|| env::var_os(name))
+    })
+}
+
+#[cfg(windows)]
+fn windows_registry_command_paths() -> Vec<PathBuf> {
+    let (registry_values, path_values) = windows_registry_environment();
+    path_values
+        .into_iter()
+        .flat_map(|value| {
+            split_windows_path_value_with(&value, |name| {
+                registry_values
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .or_else(|| env::var_os(name))
+            })
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_registry_environment() -> (HashMap<String, OsString>, Vec<OsString>) {
+    use winreg::{
+        enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+        RegKey,
+    };
+
+    const TOOL_VARIABLES: &[&str] = &[
+        "PNPM_HOME",
+        "NPM_CONFIG_PREFIX",
+        "VOLTA_HOME",
+        "BUN_INSTALL",
+        "SCOOP",
+        "ChocolateyInstall",
+        "NVM_HOME",
+        "NVM_SYMLINK",
+        "FNM_DIR",
+    ];
+    let keys = [
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+        (HKEY_CURRENT_USER, r"Environment"),
+    ];
+    let mut values = HashMap::new();
+    let mut paths = Vec::new();
+    for (hive, subkey) in keys {
+        let Ok(key) = RegKey::predef(hive).open_subkey(subkey) else {
+            continue;
+        };
+        if let Ok(path) = key.get_value::<OsString, _>("Path") {
+            paths.push(path);
+        }
+        for name in TOOL_VARIABLES {
+            if let Ok(value) = key.get_value::<OsString, _>(name) {
+                values.insert(name.to_ascii_lowercase(), value);
+            }
+        }
+    }
+    (values, paths)
+}
+
+#[cfg(any(test, windows))]
+fn split_windows_path_value(value: &OsStr) -> Vec<PathBuf> {
+    split_windows_path_value_with(value, |name| env::var_os(name))
+}
+
+#[cfg(any(test, windows))]
+fn split_windows_path_value_with<F>(value: &OsStr, mut environment_value: F) -> Vec<PathBuf>
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    value
+        .to_string_lossy()
+        .split(';')
+        .map(str::trim)
+        .map(|entry| entry.trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            expand_windows_environment_variables_with(entry, |name| environment_value(name))
+        })
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(any(test, windows))]
+fn expand_windows_environment_variables(value: &str) -> String {
+    expand_windows_environment_variables_with(value, |name| env::var_os(name))
+}
+
+#[cfg(any(test, windows))]
+fn expand_windows_environment_variables_with<F>(value: &str, mut environment_value: F) -> String
+where
+    F: FnMut(&str) -> Option<OsString>,
+{
+    let mut expanded = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find('%') {
+        expanded.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('%') else {
+            expanded.push_str(&rest[start..]);
+            return expanded;
+        };
+        let name = &after_start[..end];
+        if let Some(replacement) = environment_value(name) {
+            expanded.push_str(&replacement.to_string_lossy());
+        } else {
+            expanded.push('%');
+            expanded.push_str(name);
+            expanded.push('%');
+        }
+        rest = &after_start[end + 1..];
+    }
+    expanded.push_str(rest);
+    expanded
 }
 
 fn append_version_manager_bins(paths: &mut Vec<PathBuf>, root: &Path, suffix: &str) {
@@ -10648,6 +10927,7 @@ pub fn run() {
             install_app_update,
             get_app_settings,
             save_app_settings,
+            set_custom_client_executable,
             list_software_catalog,
             parse_provider_config,
             detect_cc_switch_config,
@@ -11243,6 +11523,14 @@ fn normalize_app_settings(mut settings: AppSettings) -> AppSettings {
     }
     settings.recent_working_directories = recent_directories;
 
+    settings
+        .custom_client_executables
+        .retain(|client_id, value| {
+            supported_provider_apps().contains(&client_id.as_str())
+                && Path::new(value).is_absolute()
+                && Path::new(value).is_file()
+        });
+
     let supported = supported_provider_apps();
     let supported_set = supported.into_iter().collect::<HashSet<_>>();
     let mut seen = HashSet::new();
@@ -11818,14 +12106,22 @@ fn replace_json_placeholder(value: &mut serde_json::Value, api_key: &str) {
 fn detect_clients() -> Vec<ClientStatus> {
     let managed = list_managed_clients().unwrap_or_default();
     let search_paths = command_search_paths();
-    detect_clients_with_search_paths(&managed, &search_paths)
+    let custom = configured_client_executables();
+    let platform = platform_client_candidates();
+    detect_clients_with_inputs(&managed, &search_paths, &custom, &platform, None)
 }
 
 fn detect_clients_with_search_paths(
     managed: &[ManagedClientRecord],
     search_paths: &[PathBuf],
 ) -> Vec<ClientStatus> {
-    detect_clients_with_search_paths_traced(managed, search_paths, None)
+    detect_clients_with_inputs(
+        managed,
+        search_paths,
+        &BTreeMap::new(),
+        &HashMap::new(),
+        None,
+    )
 }
 
 fn detect_clients_with_search_paths_traced(
@@ -11833,11 +12129,29 @@ fn detect_clients_with_search_paths_traced(
     search_paths: &[PathBuf],
     operation: Option<&telemetry::OperationContext>,
 ) -> Vec<ClientStatus> {
+    detect_clients_with_inputs(
+        managed,
+        search_paths,
+        &BTreeMap::new(),
+        &HashMap::new(),
+        operation,
+    )
+}
+
+fn detect_clients_with_inputs(
+    managed: &[ManagedClientRecord],
+    search_paths: &[PathBuf],
+    custom_executables: &BTreeMap<String, String>,
+    platform_candidates: &HashMap<String, ExternalClientCandidate>,
+    operation: Option<&telemetry::OperationContext>,
+) -> Vec<ClientStatus> {
     std::thread::scope(|scope| {
         let handles = client_detection_specs()
             .into_iter()
             .map(|(id, name, executable_names)| {
                 let client_paths = client_command_search_paths_from_base(id, search_paths);
+                let custom_executable = custom_executables.get(id).map(String::as_str);
+                let platform_candidate = platform_candidates.get(id);
                 scope.spawn(move || {
                     let span = operation.and_then(|operation| {
                         operation
@@ -11860,6 +12174,8 @@ fn detect_clients_with_search_paths_traced(
                         client_user_config_dir(id),
                         managed,
                         &client_paths,
+                        custom_executable,
+                        platform_candidate,
                         span.as_ref(),
                     );
                     if let Some(span) = span {
@@ -11907,7 +12223,10 @@ fn refresh_client_detection_traced(
 ) -> Vec<ClientStatus> {
     let managed = list_managed_clients().unwrap_or_default();
     let search_paths = command_search_paths();
-    let clients = detect_clients_with_search_paths_traced(&managed, &search_paths, operation);
+    let custom = configured_client_executables();
+    let platform = platform_client_candidates();
+    let clients =
+        detect_clients_with_inputs(&managed, &search_paths, &custom, &platform, operation);
     if let Ok(mut cache) = client_detection_cache().lock() {
         *cache = Some((Instant::now(), clients.clone()));
     }
@@ -11920,12 +12239,7 @@ fn cached_client_for_launch(client_id: &str) -> Option<ClientStatus> {
         .ok()
         .and_then(|cache| cache.as_ref().map(|(_, clients)| clients.clone()))
         .and_then(|clients| clients.into_iter().find(|client| client.id == client_id))
-        .filter(|client| {
-            client
-                .executable
-                .as_deref()
-                .is_some_and(|executable| Path::new(executable).exists())
-        })
+        .filter(client_target_is_available)
 }
 
 fn cached_client_detection() -> Vec<ClientStatus> {
@@ -11974,6 +12288,8 @@ fn detect_client_with_search_paths(
         managed_clients,
         search_paths,
         None,
+        None,
+        None,
     )
 }
 
@@ -11984,19 +12300,33 @@ fn detect_client_with_search_paths_traced(
     user_config_dir: Option<PathBuf>,
     managed_clients: &[ManagedClientRecord],
     search_paths: &[PathBuf],
+    custom_executable: Option<&str>,
+    platform_candidate: Option<&ExternalClientCandidate>,
     span: Option<&telemetry::SpanContext>,
 ) -> ClientStatus {
     let managed = managed_clients
         .iter()
         .find(|client| client.id == id && client.installed && managed_client_is_runnable(client));
-    let (external_executable, external_version) =
-        detect_external_client_with_search_paths(id, executable_names, search_paths, span);
+    let external = detect_external_client_with_search_paths(
+        id,
+        executable_names,
+        search_paths,
+        custom_executable,
+        platform_candidate,
+        span,
+    );
     let executable = managed
         .map(|client| client.launcher_path.clone())
-        .or(external_executable);
-    let version = managed
-        .map(|client| client.version.clone())
-        .or(external_version);
+        .or_else(|| {
+            external
+                .as_ref()
+                .map(|candidate| candidate.executable.clone())
+        });
+    let version = managed.map(|client| client.version.clone()).or_else(|| {
+        external
+            .as_ref()
+            .and_then(|candidate| candidate.version.clone())
+    });
 
     let config_path = if managed.is_some() {
         user_config_dir.and_then(|path| {
@@ -12017,40 +12347,469 @@ fn detect_client_with_search_paths_traced(
         executable,
         config_path,
         managed_by_agentdock: managed.is_some(),
+        custom_executable: managed.is_none()
+            && external.as_ref().is_some_and(|candidate| candidate.custom),
+        desktop_app: managed.is_none()
+            && external
+                .as_ref()
+                .is_some_and(|candidate| candidate.desktop_app),
+        detection_source: if managed.is_some() {
+            "agentdock".to_string()
+        } else {
+            external
+                .as_ref()
+                .map(|candidate| candidate.source.clone())
+                .unwrap_or_default()
+        },
     }
 }
 
 fn detect_external_client_with_search_paths(
-    _id: &str,
+    id: &str,
     executable_names: &[&str],
     search_paths: &[PathBuf],
+    custom_executable: Option<&str>,
+    platform_candidate: Option<&ExternalClientCandidate>,
     span: Option<&telemetry::SpanContext>,
-) -> (Option<String>, Option<String>) {
+) -> Option<ExternalClientCandidate> {
+    if let Some(path) = custom_executable
+        .map(Path::new)
+        .filter(|path| path.is_file())
+    {
+        let executable = display_path(path);
+        let desktop_app = custom_client_is_desktop_app(id, path);
+        let version = if desktop_app {
+            None
+        } else {
+            client_version_for_detection(&executable, span)
+        };
+        return Some(ExternalClientCandidate {
+            executable,
+            version,
+            desktop_app,
+            source: "manual".to_string(),
+            custom: true,
+        });
+    }
+
     if let Some(path) = executable_names
         .iter()
         .find_map(|name| find_executable_in_paths(name, &search_paths))
     {
-        let executable = path.display().to_string();
-        let command_span = span.and_then(|span| {
-            let command = command_version_command(&executable);
-            begin_command_span(span, &command)
+        let executable = display_path(&path);
+        return Some(ExternalClientCandidate {
+            version: client_version_for_detection(&executable, span),
+            executable,
+            desktop_app: false,
+            source: "path".to_string(),
+            custom: false,
         });
-        let version = command_version_traced(&executable, command_span.as_ref())
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        if let (Some(_), Some(span)) = (&version, command_span.as_ref()) {
-            let _ = span.finish_ok();
-        }
-        return (Some(executable), version);
+    }
+
+    if let Some(candidate) = platform_candidate {
+        return Some(candidate.clone());
     }
 
     #[cfg(target_os = "macos")]
-    if let Some(bundle) = find_macos_client_app(_id) {
+    if let Some(bundle) = find_macos_client_app(id) {
         let version = macos_app_bundle_version(&bundle);
-        return (Some(bundle.display().to_string()), version);
+        return Some(ExternalClientCandidate {
+            executable: display_path(&bundle),
+            version,
+            desktop_app: true,
+            source: "macos-app".to_string(),
+            custom: false,
+        });
     }
 
-    (None, None)
+    None
+}
+
+fn client_version_for_detection(
+    executable: &str,
+    span: Option<&telemetry::SpanContext>,
+) -> Option<String> {
+    let command_span = span.and_then(|span| {
+        let command = command_version_command(executable);
+        begin_command_span(span, &command)
+    });
+    let version = command_version_traced(executable, command_span.as_ref())
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(_), Some(span)) = (&version, command_span.as_ref()) {
+        let _ = span.finish_ok();
+    }
+    version
+}
+
+fn configured_client_executables() -> BTreeMap<String, String> {
+    agentdock_dirs()
+        .and_then(|dirs| read_app_settings(&dirs))
+        .map(|settings| settings.custom_client_executables)
+        .unwrap_or_default()
+}
+
+#[cfg(not(windows))]
+fn platform_client_candidates() -> HashMap<String, ExternalClientCandidate> {
+    HashMap::new()
+}
+
+#[cfg(windows)]
+fn platform_client_candidates() -> HashMap<String, ExternalClientCandidate> {
+    let mut candidates = windows_registry_client_candidates();
+    for (client_id, candidate) in windows_common_install_candidates() {
+        candidates.entry(client_id).or_insert(candidate);
+    }
+    for (client_id, candidate) in windows_appx_client_candidates() {
+        candidates.entry(client_id).or_insert(candidate);
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn windows_desktop_client_spec(
+    client_id: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match client_id {
+        "codex" => Some((&["codex.exe"], &["Codex", "OpenAI Codex", "OpenAI/Codex"])),
+        "claude-desktop" => Some((
+            &["claude.exe", "claude-desktop.exe"],
+            &["Claude", "Claude Desktop", "Anthropic/Claude"],
+        )),
+        "opencode" => Some((
+            &["opencode.exe", "opencode-desktop.exe"],
+            &["OpenCode", "OpenCode Desktop"],
+        )),
+        "openclaw" => Some((&["openclaw.exe"], &["OpenClaw", "OpenClaw Desktop"])),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn windows_registry_client_candidates() -> HashMap<String, ExternalClientCandidate> {
+    use winreg::{
+        enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+        RegKey,
+    };
+
+    let roots = [
+        RegKey::predef(HKEY_CURRENT_USER),
+        RegKey::predef(HKEY_LOCAL_MACHINE),
+    ];
+    let mut candidates = HashMap::new();
+
+    for root in &roots {
+        for client_id in ["codex", "claude-desktop", "opencode", "openclaw"] {
+            let Some((executable_names, _)) = windows_desktop_client_spec(client_id) else {
+                continue;
+            };
+            for executable_name in executable_names {
+                for prefix in [
+                    r"Software\Microsoft\Windows\CurrentVersion\App Paths",
+                    r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths",
+                ] {
+                    let key_path = format!(r"{}\{}", prefix, executable_name);
+                    let Some(path) = root
+                        .open_subkey(&key_path)
+                        .ok()
+                        .and_then(|key| key.get_value::<String, _>("").ok())
+                        .map(|value| expand_windows_environment_variables(&value))
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_file())
+                    else {
+                        continue;
+                    };
+                    candidates.entry(client_id.to_string()).or_insert_with(|| {
+                        ExternalClientCandidate {
+                            executable: display_path(&path),
+                            version: None,
+                            desktop_app: true,
+                            source: "windows-registry".to_string(),
+                            custom: false,
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    for root in &roots {
+        for prefix in [
+            r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ] {
+            let Ok(uninstall) = root.open_subkey(prefix) else {
+                continue;
+            };
+            for subkey_name in uninstall.enum_keys().flatten() {
+                let Ok(entry) = uninstall.open_subkey(subkey_name) else {
+                    continue;
+                };
+                let Ok(display_name) = entry.get_value::<String, _>("DisplayName") else {
+                    continue;
+                };
+                let Some(client_id) = windows_client_id_from_display_name(&display_name) else {
+                    continue;
+                };
+                if candidates.contains_key(client_id) {
+                    continue;
+                }
+                let display_icon = entry
+                    .get_value::<String, _>("DisplayIcon")
+                    .ok()
+                    .and_then(|value| windows_display_icon_path(&value))
+                    .filter(|path| windows_executable_path_matches_client(path, client_id));
+                let install_location = entry
+                    .get_value::<String, _>("InstallLocation")
+                    .ok()
+                    .map(|value| expand_windows_environment_variables(&value))
+                    .map(PathBuf::from);
+                let executable = display_icon.filter(|path| path.is_file()).or_else(|| {
+                    install_location
+                        .as_deref()
+                        .and_then(|root| find_windows_client_executable(root, client_id, 3))
+                });
+                let Some(executable) = executable else {
+                    continue;
+                };
+                let version = entry
+                    .get_value::<String, _>("DisplayVersion")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty());
+                candidates.insert(
+                    client_id.to_string(),
+                    ExternalClientCandidate {
+                        executable: display_path(&executable),
+                        version,
+                        desktop_app: true,
+                        source: "windows-registry".to_string(),
+                        custom: false,
+                    },
+                );
+            }
+        }
+    }
+    candidates
+}
+
+#[cfg(any(test, windows))]
+fn windows_client_id_from_display_name(display_name: &str) -> Option<&'static str> {
+    let normalized = display_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    if normalized == "codex" || normalized.contains("openaicodex") {
+        Some("codex")
+    } else if normalized == "claude"
+        || normalized.contains("claudedesktop")
+        || normalized.contains("anthropicclaude")
+    {
+        Some("claude-desktop")
+    } else if normalized.contains("opencode") {
+        Some("opencode")
+    } else if normalized.contains("openclaw") {
+        Some("openclaw")
+    } else {
+        None
+    }
+}
+
+#[cfg(any(test, windows))]
+fn windows_display_icon_path(value: &str) -> Option<PathBuf> {
+    let value = value.trim();
+    let path = if let Some(quoted) = value.strip_prefix('"') {
+        quoted.split_once('"').map(|(path, _)| path)?
+    } else {
+        value
+            .rsplit_once(',')
+            .filter(|(_, suffix)| suffix.trim().parse::<i32>().is_ok())
+            .map(|(path, _)| path)
+            .unwrap_or(value)
+            .trim()
+    };
+    (!path.is_empty()).then(|| PathBuf::from(expand_windows_environment_variables(path)))
+}
+
+#[cfg(any(test, windows))]
+fn windows_executable_path_matches_client(path: &Path, client_id: &str) -> bool {
+    let Some((names, _)) = windows_desktop_client_spec_for_test(client_id) else {
+        return false;
+    };
+    let path_text = path.to_string_lossy();
+    let file_name = path_text
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path_text.as_ref());
+    names
+        .iter()
+        .any(|name| file_name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(windows)]
+fn windows_common_install_candidates() -> HashMap<String, ExternalClientCandidate> {
+    let local = env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let program_files = env::var_os("ProgramFiles").map(PathBuf::from);
+    let program_files_x86 = env::var_os("ProgramFiles(x86)").map(PathBuf::from);
+    let mut candidates = HashMap::new();
+    for client_id in ["codex", "claude-desktop", "opencode", "openclaw"] {
+        let Some((_, folder_names)) = windows_desktop_client_spec(client_id) else {
+            continue;
+        };
+        let roots = [
+            local.as_deref(),
+            program_files.as_deref(),
+            program_files_x86.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|root| {
+            folder_names
+                .iter()
+                .flat_map(move |folder| [root.join("Programs").join(folder), root.join(folder)])
+        });
+        if let Some(executable) = roots
+            .filter(|root| root.is_dir())
+            .find_map(|root| find_windows_client_executable(&root, client_id, 3))
+        {
+            candidates.insert(
+                client_id.to_string(),
+                ExternalClientCandidate {
+                    executable: display_path(&executable),
+                    version: None,
+                    desktop_app: true,
+                    source: "windows-install-dir".to_string(),
+                    custom: false,
+                },
+            );
+        }
+    }
+    candidates
+}
+
+#[cfg(any(test, windows))]
+fn find_windows_client_executable(root: &Path, client_id: &str, depth: usize) -> Option<PathBuf> {
+    let (names, _) = windows_desktop_client_spec_for_test(client_id)?;
+    for name in names {
+        let candidate = root.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    let mut directories = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories
+        .into_iter()
+        .find_map(|path| find_windows_client_executable(&path, client_id, depth - 1))
+}
+
+#[cfg(windows)]
+fn windows_desktop_client_spec_for_test(
+    client_id: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    windows_desktop_client_spec(client_id)
+}
+
+#[cfg(all(test, not(windows)))]
+fn windows_desktop_client_spec_for_test(
+    client_id: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match client_id {
+        "codex" => Some((&["codex.exe"], &["Codex", "OpenAI Codex", "OpenAI/Codex"])),
+        "claude-desktop" => Some((
+            &["claude.exe", "claude-desktop.exe"],
+            &["Claude", "Claude Desktop", "Anthropic/Claude"],
+        )),
+        "opencode" => Some((
+            &["opencode.exe", "opencode-desktop.exe"],
+            &["OpenCode", "OpenCode Desktop"],
+        )),
+        "openclaw" => Some((&["openclaw.exe"], &["OpenClaw", "OpenClaw Desktop"])),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsAppxClient {
+    name: String,
+    publisher: String,
+    family: String,
+    version: String,
+    app_id: String,
+    executable: String,
+}
+
+#[cfg(windows)]
+fn windows_appx_client_candidates() -> HashMap<String, ExternalClientCandidate> {
+    let script = r#"$ErrorActionPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $packages=@(); foreach($pattern in @('*Codex*','*OpenAI*','*Claude*','*Anthropic*','*OpenCode*','*OpenClaw*')) { $packages += @(Get-AppxPackage -Name $pattern) }; $items=@(); foreach($pkg in @($packages | Sort-Object PackageFullName -Unique)) { try { $manifest=Get-AppxPackageManifest -Package $pkg.PackageFullName -ErrorAction Stop; foreach($app in @($manifest.Package.Applications.Application)) { $items += [PSCustomObject]@{ name=[string]$pkg.Name; publisher=[string]$pkg.Publisher; family=[string]$pkg.PackageFamilyName; version=[string]$pkg.Version; appId=[string]$app.Id; executable=[string]$app.Executable } } } catch {} }; ConvertTo-Json -Compress -InputObject @($items)"#;
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    let Ok(output) = command_output_with_timeout_message(
+        &mut command,
+        std::time::Duration::from_secs(5),
+        "读取 Windows 应用包超时",
+    ) else {
+        return HashMap::new();
+    };
+    if !output.status.success() {
+        return HashMap::new();
+    }
+    let Ok(records) = serde_json::from_slice::<Vec<WindowsAppxClient>>(&output.stdout) else {
+        return HashMap::new();
+    };
+    let mut candidates = HashMap::new();
+    for record in records {
+        let identity = format!(
+            "{} {} {} {}",
+            record.name, record.publisher, record.family, record.executable
+        );
+        let Some(client_id) = windows_client_id_from_display_name(&identity) else {
+            continue;
+        };
+        if record.family.trim().is_empty() || record.app_id.trim().is_empty() {
+            continue;
+        }
+        candidates
+            .entry(client_id.to_string())
+            .or_insert_with(|| ExternalClientCandidate {
+                executable: format!(r"shell:AppsFolder\{}!{}", record.family, record.app_id),
+                version: (!record.version.trim().is_empty()).then_some(record.version),
+                desktop_app: true,
+                source: "windows-appx".to_string(),
+                custom: false,
+            });
+    }
+    candidates
+}
+
+fn client_target_is_available(client: &ClientStatus) -> bool {
+    client.executable.as_deref().is_some_and(|executable| {
+        client.desktop_app && executable.starts_with(r"shell:AppsFolder\")
+            || Path::new(executable).exists()
+    })
+}
+
+fn custom_client_is_desktop_app(client_id: &str, path: &Path) -> bool {
+    if client_id == "claude-desktop" {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    return is_macos_app_bundle(path);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 fn managed_client_is_runnable(client: &ManagedClientRecord) -> bool {
@@ -16657,6 +17416,174 @@ requires_openai_auth = true"#;
         assert!(user_config_dir.is_dir());
         assert!(status.managed_by_agentdock);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_known_paths_cover_package_managers_and_fnm_installations() {
+        let root = env::temp_dir().join(format!(
+            "agentdock-windows-paths-test-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let home = root.join("Users/tester");
+        let roaming = home.join("AppData/Roaming");
+        let local = home.join("AppData/Local");
+        let fnm = roaming.join("fnm/node-versions/v22.0.0/installation");
+        fs::create_dir_all(&fnm).unwrap();
+        let values = HashMap::from([
+            ("APPDATA", roaming.as_os_str().to_os_string()),
+            ("LOCALAPPDATA", local.as_os_str().to_os_string()),
+            ("PNPM_HOME", root.join("pnpm-home").into_os_string()),
+            ("SCOOP", root.join("scoop-home").into_os_string()),
+            ("NVM_SYMLINK", root.join("nvm-nodejs").into_os_string()),
+        ]);
+
+        let paths =
+            windows_known_command_paths_from_environment(&home, |name| values.get(name).cloned());
+
+        assert!(paths.contains(&roaming.join("npm")));
+        assert!(paths.contains(&local.join("pnpm")));
+        assert!(paths.contains(&local.join("Microsoft/WindowsApps")));
+        assert!(paths.contains(&root.join("pnpm-home")));
+        assert!(paths.contains(&root.join("scoop-home/shims")));
+        assert!(paths.contains(&root.join("nvm-nodejs")));
+        assert!(paths.contains(&fnm));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_windows_registry_paths_and_client_metadata() {
+        assert_eq!(
+            split_windows_path_value(OsStr::new(r#" "C:\Tools" ; D:\Apps;; "#)),
+            vec![PathBuf::from(r"C:\Tools"), PathBuf::from(r"D:\Apps")]
+        );
+        assert_eq!(
+            windows_display_icon_path(r#""C:\Program Files\Codex\Codex.exe",0"#),
+            Some(PathBuf::from(r"C:\Program Files\Codex\Codex.exe"))
+        );
+        assert_eq!(
+            windows_client_id_from_display_name("OpenAI.Codex_123 Codex.exe"),
+            Some("codex")
+        );
+        assert_eq!(
+            windows_client_id_from_display_name("Anthropic.Claude Desktop"),
+            Some("claude-desktop")
+        );
+        assert_eq!(windows_client_id_from_display_name("Grok Chat"), None);
+        assert_eq!(
+            split_windows_path_value_with(
+                OsStr::new(r"%PNPM_HOME%;%FNM_DIR%\aliases\default"),
+                |name| match name {
+                    "PNPM_HOME" => Some(OsString::from(r"D:\pnpm")),
+                    "FNM_DIR" => Some(OsString::from(r"D:\fnm")),
+                    _ => None,
+                }
+            ),
+            vec![
+                PathBuf::from(r"D:\pnpm"),
+                PathBuf::from(r"D:\fnm\aliases\default")
+            ]
+        );
+        assert!(windows_executable_path_matches_client(
+            Path::new(r"C:\Program Files\Codex\Codex.exe"),
+            "codex"
+        ));
+        assert!(!windows_executable_path_matches_client(
+            Path::new(r"C:\Program Files\Codex\codex.ico"),
+            "codex"
+        ));
+    }
+
+    #[test]
+    fn finds_windows_desktop_executable_in_bounded_install_tree() {
+        let root = env::temp_dir().join(format!(
+            "agentdock-windows-app-test-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let executable = root.join("app-1.2.3/resources/Codex.exe");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "fixture").unwrap();
+
+        let found = find_windows_client_executable(&root, "codex", 3).unwrap();
+        assert!(found.is_file());
+        assert!(found
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("Codex.exe")));
+        assert_eq!(find_windows_client_executable(&root, "grok", 3), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_client_executable_takes_priority_and_is_reported() {
+        let root = env::temp_dir().join(format!(
+            "agentdock-custom-client-test-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let executable_name = if cfg!(windows) { "codex.cmd" } else { "codex" };
+        let manual = root.join("manual").join(executable_name);
+        let discovered = root.join("path").join(executable_name);
+        fs::create_dir_all(manual.parent().unwrap()).unwrap();
+        fs::create_dir_all(discovered.parent().unwrap()).unwrap();
+        fs::write(
+            &manual,
+            if cfg!(windows) {
+                "@echo manual 1.0\r\n"
+            } else {
+                "#!/bin/sh\nprintf 'manual 1.0'\n"
+            },
+        )
+        .unwrap();
+        fs::write(
+            &discovered,
+            if cfg!(windows) {
+                "@echo path 2.0\r\n"
+            } else {
+                "#!/bin/sh\nprintf 'path 2.0'\n"
+            },
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            make_executable(&manual).unwrap();
+            make_executable(&discovered).unwrap();
+        }
+        let custom = BTreeMap::from([("codex".to_string(), display_path(&manual))]);
+        let statuses = detect_clients_with_inputs(
+            &[],
+            &[discovered.parent().unwrap().to_path_buf()],
+            &custom,
+            &HashMap::new(),
+            None,
+        );
+        let codex = statuses.iter().find(|client| client.id == "codex").unwrap();
+
+        assert_eq!(codex.executable.as_deref(), manual.to_str());
+        assert_eq!(codex.version.as_deref(), Some("manual 1.0"));
+        assert!(codex.custom_executable);
+        assert_eq!(codex.detection_source, "manual");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn appx_desktop_target_is_available_without_a_filesystem_path() {
+        let status = ClientStatus {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            installed: true,
+            version: Some("1.2.3".to_string()),
+            executable: Some(r"shell:AppsFolder\OpenAI.Codex_123!App".to_string()),
+            config_path: None,
+            managed_by_agentdock: false,
+            custom_executable: false,
+            desktop_app: true,
+            detection_source: "windows-appx".to_string(),
+        };
+
+        assert!(client_target_is_available(&status));
+        assert!(!client_uses_working_directory(&status));
     }
 
     #[test]
