@@ -3845,10 +3845,35 @@ async fn install_client_inner(
 fn list_managed_clients() -> Result<Vec<ManagedClientRecord>, String> {
     let dirs = agentdock_dirs()?;
     ensure_dirs(&dirs)?;
-    read_json_or_seed(
-        &managed_clients_path(&dirs),
-        Vec::<ManagedClientRecord>::new(),
-    )
+    let path = managed_clients_path(&dirs);
+    let mut clients = read_json_or_seed(&path, Vec::<ManagedClientRecord>::new())?;
+    if repair_managed_client_launchers(&mut clients) {
+        write_json(&path, &clients)?;
+    }
+    Ok(clients)
+}
+
+fn repair_managed_client_launchers(clients: &mut [ManagedClientRecord]) -> bool {
+    let mut repaired = false;
+    for client in clients {
+        let launcher_name = Path::new(&client.launcher_path)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if client.id != "codex"
+            || !client.installed
+            || !is_codex_internal_helper_name(launcher_name)
+        {
+            continue;
+        }
+        let Ok(executable) = find_client_executable(Path::new(&client.install_dir), &client.id)
+        else {
+            continue;
+        };
+        client.launcher_path = display_path(&executable);
+        repaired = true;
+    }
+    repaired
 }
 
 #[tauri::command]
@@ -14645,6 +14670,7 @@ fn find_client_executable(root: &Path, client_id: &str) -> Result<PathBuf, Strin
         client_id
     };
     let mut directories = vec![root.to_path_buf()];
+    let mut candidates = Vec::new();
     while let Some(directory) = directories.pop() {
         for entry in fs::read_dir(&directory).map_err(|err| format!("检查安装文件失败: {}", err))?
         {
@@ -14659,19 +14685,45 @@ fn find_client_executable(root: &Path, client_id: &str) -> Result<PathBuf, Strin
                 .and_then(|value| value.to_str())
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let valid_name = name == prefix
-                || name == format!("{}.exe", prefix)
-                || name.starts_with(&format!("{}-", prefix));
             let ignored = name.ends_with(".sigstore")
                 || name.ends_with(".sha256")
                 || name.ends_with(".txt")
                 || name.ends_with(".json");
-            if valid_name && !ignored {
-                return Ok(path);
+            if ignored {
+                continue;
+            }
+            let rank = if name == prefix || name == format!("{}.exe", prefix) {
+                Some(0)
+            } else if client_id == "codex" && is_codex_internal_helper_name(&name) {
+                None
+            } else if name.starts_with(&format!("{}-", prefix)) {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(rank) = rank {
+                candidates.push((rank, path));
             }
         }
     }
-    Err(format!("安装包中没有找到 {} 启动文件", client_id))
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, path)| path)
+        .ok_or_else(|| format!("安装包中没有找到 {} 启动文件", client_id))
+}
+
+fn is_codex_internal_helper_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "codex-command-runner"
+            | "codex-command-runner.exe"
+            | "codex-code-mode-host"
+            | "codex-code-mode-host.exe"
+            | "codex-windows-sandbox-setup"
+            | "codex-windows-sandbox-setup.exe"
+    )
 }
 
 fn bundled_client_payload_dir(client_id: &str) -> Option<PathBuf> {
@@ -17512,6 +17564,54 @@ requires_openai_auth = true"#;
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case("Codex.exe")));
         assert_eq!(find_windows_client_executable(&root, "grok", 3), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_codex_package_prefers_public_cli_over_internal_runners() {
+        let root = env::temp_dir().join(format!(
+            "agentdock-managed-codex-entry-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let public_cli = root.join("package/vendor/x86_64-pc-windows-msvc/bin/codex.exe");
+        let resources = root.join("package/vendor/x86_64-pc-windows-msvc/codex-resources");
+        fs::create_dir_all(public_cli.parent().unwrap()).unwrap();
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(&public_cli, "codex cli").unwrap();
+        fs::write(
+            resources.join("codex-command-runner.exe"),
+            "internal runner",
+        )
+        .unwrap();
+        fs::write(
+            resources.join("codex-windows-sandbox-setup.exe"),
+            "internal setup",
+        )
+        .unwrap();
+
+        assert_eq!(find_client_executable(&root, "codex").unwrap(), public_cli);
+
+        let mut clients = vec![ManagedClientRecord {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            installed: true,
+            version: "1.0.0".to_string(),
+            install_dir: root.display().to_string(),
+            launcher_path: resources
+                .join("codex-command-runner.exe")
+                .display()
+                .to_string(),
+            config_dir: root.join("config").display().to_string(),
+            installed_at: "2026-08-03T00:00:00Z".to_string(),
+            updated_at: "2026-08-03T00:00:00Z".to_string(),
+        }];
+        assert!(repair_managed_client_launchers(&mut clients));
+        assert_eq!(PathBuf::from(&clients[0].launcher_path), public_cli);
+        assert!(!repair_managed_client_launchers(&mut clients));
+
+        fs::remove_file(&public_cli).unwrap();
+        assert!(find_client_executable(&root, "codex").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
